@@ -1,0 +1,208 @@
+version: '3.9'
+
+services:
+  # =============================================================
+  # PostgreSQL 16 + PostGIS 3.4 — Banco de dados principal
+  # =============================================================
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: datahub-postgres
+    environment:
+      POSTGRES_DB: datahub_fundiario
+      POSTGRES_USER: datahub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-datahub_dev_2026}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U datahub -d datahub_fundiario"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - datahub-network
+
+  # =============================================================
+  # Apache Kafka + Zookeeper — Barramento de eventos
+  # =============================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: datahub-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - datahub-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: datahub-kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "29092:29092"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - datahub-network
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: datahub-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      echo 'Criando topicos Kafka do Data Hub Fundiario...'
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic reurb.nucleo.submitted --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic reurb.nucleo.validated --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic reurb.nucleo.status_changed --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic saec.registration.requested --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic saec.registration.confirmed --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic saec.registration.rejected --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic pje.lawsuit.synced --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic desjud.candidate.created --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic desjud.candidate.decided --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic geo.conflict.detected --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic sicase.seals.imported --partitions 3 --replication-factor 1
+      echo 'Topicos criados com sucesso!'
+      "
+    networks:
+      - datahub-network
+
+  # =============================================================
+  # Keycloak 24 — Autenticacao e autorizacao (SSO, RBAC, ICP-Brasil)
+  # =============================================================
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: datahub-keycloak
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_PASSWORD:-admin_dev_2026}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/datahub_fundiario
+      KC_DB_USERNAME: datahub
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-datahub_dev_2026}
+      KC_DB_SCHEMA: keycloak
+    command: start-dev
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - datahub-network
+
+  # =============================================================
+  # GeoServer 2.25 — Servidor OGC WMS/WFS para camadas espaciais
+  # =============================================================
+  geoserver:
+    image: kartoza/geoserver:2.25.2
+    container_name: datahub-geoserver
+    environment:
+      GEOSERVER_ADMIN_USER: admin
+      GEOSERVER_ADMIN_PASSWORD: ${GEOSERVER_PASSWORD:-geoserver_dev_2026}
+      INITIAL_MEMORY: 512m
+      MAXIMUM_MEMORY: 2g
+      GEOSERVER_DATA_DIR: /opt/geoserver/data_dir
+      STABLE_EXTENSIONS: "importer,wps"
+    ports:
+      - "8600:8080"
+    volumes:
+      - geoserver_data:/opt/geoserver/data_dir
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - datahub-network
+
+  # =============================================================
+  # MinIO — Object storage para documentos (PDF, DWG, plantas)
+  # =============================================================
+  minio:
+    image: minio/minio:latest
+    container_name: datahub-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-datahub_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-minio_dev_2026}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - datahub-network
+
+  # =============================================================
+  # Redis — Cache para queries frequentes e sessoes
+  # =============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: datahub-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - datahub-network
+
+  # =============================================================
+  # Kafka UI — Interface de monitoramento do Kafka
+  # =============================================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: datahub-kafka-ui
+    environment:
+      KAFKA_CLUSTERS_0_NAME: datahub-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    ports:
+      - "8090:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - datahub-network
+
+volumes:
+  postgres_data:
+    name: datahub-postgres-data
+  geoserver_data:
+    name: datahub-geoserver-data
+  minio_data:
+    name: datahub-minio-data
+  redis_data:
+    name: datahub-redis-data
+
+networks:
+  datahub-network:
+    name: datahub-network
+    driver: bridge
